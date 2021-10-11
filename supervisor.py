@@ -1,16 +1,18 @@
 import subprocess
-import psutil
 import json
+from abc import abstractmethod
 import time
 import smtplib
 import logging
 import logging.config
-from abc import abstractmethod
 from logging.handlers import RotatingFileHandler
 from urllib import request, error
 from email.message import EmailMessage
-from threading import Thread, Event
+from threading import Lock, Thread, Event, enumerate
 from queue import Queue
+import pyautogui
+from win32 import win32gui
+import psutil
 
 SETTINGS_FILE_PATH = 'settings.json'
 
@@ -74,10 +76,27 @@ class ProcessHandler(Thread):
 
 class ProcessHandlerNew(ProcessHandler):
 
-    def __init__(self, name, path, process_queue, event, logger=None):
+    def __init__(self, name, path, process_queue, event, lock=None, logger=None):
         super().__init__(name, path, process_queue, event, logger=logger)
-        self.process = subprocess.Popen(self.path, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        self.pid = self.process.pid
+        with lock:
+            self.process = subprocess.Popen(self.path, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.pid = self.process.pid
+            try:
+                self.process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                if self.process.returncode is None:
+                    window = win32gui.GetForegroundWindow()
+                    active_window_name = win32gui.GetWindowText(window)
+                    rect = win32gui.GetWindowRect(window)
+                    if active_window_name == 'Telex':
+                        buttons = list(pyautogui.locateAllOnScreen('recieve.png'))
+                        for button in buttons:
+                            x=button[0]+(button[2]//2)
+                            y=button[1]+(button[3]//2)
+                            if rect[0] < x < rect[2] and rect[1] < y < rect[3]:
+                                pyautogui.click(x=button[0]+(button[2]//2), y=button[1]+(button[3]//2), clicks=2, button='left')
+                    time.sleep(1)    
+        
 
     def wait(self):
         self.process.wait()
@@ -91,10 +110,10 @@ class ProcessHandlerNew(ProcessHandler):
 
 class ProcessHandlerExist(ProcessHandler):
 
-    def __init__(self, name, path, process_queue, event,pid=None, logger=None):
+    def __init__(self, name, path, process_queue, event, pid=None, logger=None):
         super().__init__(name, path, process_queue, event, logger=logger)
         self.pid = pid
-        self.process = psutil.Process(pid=self.pid)
+        self.process = psutil.Process(pid=pid)
 
 
     def wait(self):
@@ -103,7 +122,6 @@ class ProcessHandlerExist(ProcessHandler):
     def terminate_info(self):
         print('{} terminated '.format(self.name))
         self.logger.info('{} terminated '.format(self.name))
-
 
 class EmailHandler(Thread):
 
@@ -166,12 +184,9 @@ class EmailHandler(Thread):
                 time.sleep(1)
             self.internet_on()
 
-
-
 def initProcessQueue(dict,queue):
     for process in dict['processes']:
         queue.put(process)
-
 
 
 def main():
@@ -196,38 +211,48 @@ def main():
     event_email = Event()
     process_queue = Queue()
     email_queue = Queue()
+    lock = Lock()
 
     emailHandler = EmailHandler(settings_dict, event_email, email_queue, logger=logger)
     emailHandler.setDaemon(True)
     emailHandler.start()
 
+    proc_list = []
+
     for p in psutil.process_iter():
-        for item in settings_dict['processes']:
-            for name, path in item.items():
-                try:
-                    if p.exe() == path:
-                        ProcessHandlerExist(name, path, process_queue,
-                                          event_process_terminated, logger=logger, pid=p.pid).start()
-                        settings_dict['processes'].remove(item)
-                except psutil.AccessDenied as e:
-                    pass
+        try:
+            proc_list.append((p.pid, p.exe()))
+        except psutil.AccessDenied as e:
+            pass
+
+    for _ in range(len(settings_dict['processes'])):
+        item = settings_dict['processes'].pop(0)
+        for name, path in item.items():
+            filtered = tuple(filter(lambda x: x[1] == path, proc_list))
+            if filtered:
+                ProcessHandlerExist(name, path, process_queue,
+                                      event_process_terminated, logger=logger,
+                                      pid=filtered[0][0]).start()
+            elif settings_dict['processes']:
+                settings_dict['processes'].append({name: path})
+            else:
+                settings_dict['processes'] = [{name: path}]
+
+   
     initProcessQueue(settings_dict, process_queue)
 
     while True:
         while True:
-           item = process_queue.get()
-           if type(item) is dict:
-               for process_name,process_path in item.items():
-                   ProcessHandlerNew(process_name, process_path, process_queue,
-                                  event_process_terminated, logger=logger).start()
-                   logger.info('process \"{}\" is started'.format(process_name))
-                   logger.info('path to \"{}\" : {}'.format(process_name, process_path))
-                   email_queue.put(process_name)
+            item = process_queue.get()
+            if type(item) is dict:
+                for process_name,process_path in item.items():
+                    ProcessHandlerNew(process_name, process_path, process_queue,
+                                    event_process_terminated,lock=lock, logger=logger).start()
+                    email_queue.put(process_name)
 
-
-           time.sleep(1)
-           if process_queue.empty():
-               break
+            time.sleep(1)
+            if process_queue.empty():
+                break
 
         print("All processes are run now")
         event_email.set()
@@ -235,6 +260,7 @@ def main():
         time.sleep(10)
 
     emailHandler.join()
+
 
 if __name__ == '__main__':
     main()
