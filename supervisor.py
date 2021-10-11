@@ -13,6 +13,7 @@ from queue import Queue
 import pyautogui
 from win32 import win32gui
 import psutil
+import platform
 
 SETTINGS_FILE_PATH = 'settings.json'
 
@@ -173,10 +174,13 @@ class EmailHandler(Thread):
         self.logger.info("Message was succesfully sent")
 
     def internet_on(self):
-        try:
-            response = request.urlopen('https://www.google.by/', timeout=5)
+        host = self.settings['smtp host']
+        param = '-n' if platform.system().lower()=='windows' else '-c'
+        command = ['ping', param, '1', host]
+        is_network = subprocess.call(command) == 0
+        if is_network:
             self.logger.info('Connection to network is passed')
-        except error.URLError:
+        else:
             self.logger.info("Network error")
             print('\n Ожидание сети 5 секунд \n')
             for i in range(1, 6):
